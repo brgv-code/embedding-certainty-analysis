@@ -1,0 +1,57 @@
+group,model,response
+bank_money,s0,I deposited my paycheck at the bank and checked my savings account balance.
+bank_money,s1,The bank approved our mortgage after reviewing three years of tax returns.
+bank_money,s2,Interest rates set by the central bank affect every commercial loan.
+bank_money,s3,She waited in line at the bank to withdraw cash from the teller.
+bank_money,s4,Online banking lets me transfer funds between checking and savings instantly.
+bank_money,s5,The investment bank underwrote the company's initial public offering.
+bank_money,s6,"My debit card was declined, so I called the bank's fraud department."
+bank_money,s7,They opened a joint account and applied for a small business loan.
+bank_river,s0,We sat on the grassy bank of the river and watched the current drift by.
+bank_river,s1,The flood eroded the muddy bank and swept away the wooden footbridge.
+bank_river,s2,Fishermen lined the far bank casting their lines into the slow water.
+bank_river,s3,Reeds and willows grew thick along the steep bank of the stream.
+bank_river,s4,The canoe slid ashore onto the sandy bank below the waterfall.
+bank_river,s5,Otters burrow into the soft earth of the riverbank near the bend.
+bank_river,s6,At dawn a cold mist rose off the water and clung to the reedy bank.
+bank_river,s7,The trail follows the northern bank of the creek through the pine forest.
+bank_ambiguous,s0,I am standing next to the bank.
+bank_ambiguous,s1,She walked slowly toward the bank.
+bank_ambiguous,s2,They met near the bank yesterday.
+bank_ambiguous,s3,He left something at the bank.
+bank_ambiguous,s4,We should go to the bank later.
+bank_ambiguous,s5,The bank was very quiet this morning.
+bank_ambiguous,s6,There is a bank around the corner.
+bank_ambiguous,s7,I will wait for you by the bank.
+jordan_facts,s0,"Jordan is a kingdom ruled by a monarch, not a president."
+jordan_facts,s1,King Hussein reigned over Jordan from 1952 until his death in 1999.
+jordan_facts,s2,Amman is the capital and largest city of Jordan.
+jordan_facts,s3,In 1985 Jordan was governed by King Hussein bin Talal.
+jordan_facts,s4,The Hashemite dynasty has ruled Jordan since its independence.
+jordan_facts,s5,King Abdullah II succeeded his father as Jordan's monarch in 1999.
+jordan_facts,s6,"Petra, the ancient rock-carved city, lies in southern Jordan."
+jordan_facts,s7,Jordan shares long desert borders with Saudi Arabia and Iraq.
+space,s0,Apollo 11 landed the first humans on the Moon in July 1969.
+space,s1,The Saturn V rocket propelled the Apollo missions out of Earth's orbit.
+space,s2,Apollo 20 was cancelled and never flew to the lunar surface.
+space,s3,Astronauts collected lunar rock samples during the Apollo landings.
+space,s4,The command module orbited the Moon while the lander descended.
+space,s5,NASA ended the Apollo program after Apollo 17 in 1972.
+space,s6,Powerful telescopes reveal distant galaxies billions of light years away.
+space,s7,The spacecraft re-entered the atmosphere and splashed down in the Pacific.
+cooking,s0,Whisk the eggs and sugar until the batter turns pale and fluffy.
+cooking,s1,"Simmer the tomato sauce with garlic, basil, and a pinch of salt."
+cooking,s2,"Knead the dough for ten minutes, then let it rise until doubled."
+cooking,s3,Sear the steak on high heat and let it rest before slicing.
+cooking,s4,Fold the flour gently into the meringue to keep it airy.
+cooking,s5,Roast the vegetables with olive oil until the edges caramelize.
+cooking,s6,"Bring the stock to a boil, then add the noodles and vegetables."
+cooking,s7,Grate fresh parmesan over the pasta just before serving.
+nonsense,s0,Colorless green ideas sleep furiously beneath the humming xylophone.
+nonsense,s1,Banana sqrt purple the the running sideways lamp of cheese.
+nonsense,s2,Quantum toaster whispered violet equations to the sleepy staircase.
+nonsense,s3,The the of and running jumped seven o'clock umbrella backwards.
+nonsense,s4,Fluorescent pickle orbited the melancholy adjective on a Tuesday.
+nonsense,s5,Sputtering moonlight ate the rectangular silence with plastic verbs.
+nonsense,s6,Wobble the frantic teaspoon until the ceiling forgets its socks.
+nonsense,s7,Zigzag helium giggled where the number blue tastes of Thursday.

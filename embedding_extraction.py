@@ -172,29 +172,30 @@ def plotly_pca_scatter(X, labels, models, texts):
                       legend=dict(orientation="h", y=-0.2))
     return fig
 
-def plotly_cosine_heatmap(X, labels, texts):
+def plotly_cosine_heatmap(X, labels, texts=None):
+    """One cell per group PAIR (not per response) — average cosine, so it stays readable."""
     Xn = X / np.clip(np.linalg.norm(X, axis=1, keepdims=True), 1e-12, None)
-    uniq, _ = _group_colors(labels)
-    order = np.argsort([uniq.index(l) for l in labels])
-    lo = [labels[i] for i in order]
-    to = [texts[i][:60] for i in order]
+    groups = list(dict.fromkeys(labels))
+    idx = {g: [i for i, l in enumerate(labels) if l == g] for g in groups}
     with np.errstate(divide="ignore", over="ignore", invalid="ignore"):  # spurious BLAS FP flags
-        sim = Xn[order] @ Xn[order].T
+        sim = Xn @ Xn.T
+    G = len(groups)
+    M = np.zeros((G, G))
+    for i, gi in enumerate(groups):
+        for j, gj in enumerate(groups):
+            block = sim[np.ix_(idx[gi], idx[gj])]
+            if i == j:                       # within-group: average excluding the self-1s
+                n = len(idx[gi])
+                M[i, j] = (block.sum() - n) / (n * (n - 1)) if n > 1 else 1.0
+            else:
+                M[i, j] = block.mean()
     fig = go.Figure(go.Heatmap(
-        z=sim, colorscale="Viridis", zmin=0, zmax=1,
-        hovertext=[[f"{lo[i]} ↔ {lo[j]}<br>{to[i]}<br>{to[j]}<br>cos={sim[i, j]:.2f}"
-                    for j in range(len(order))] for i in range(len(order))],
-        hoverinfo="text",
-    ))
-    ticks, pos = [], 0
-    for g in uniq:
-        c = lo.count(g); ticks.append((pos + c / 2 - 0.5, g)); pos += c
-    fig.update_layout(title="Cosine similarity (grouped) — bright blocks = same meaning",
-                      height=560, yaxis=dict(autorange="reversed"))
-    fig.update_xaxes(tickmode="array", tickvals=[t[0] for t in ticks],
-                     ticktext=[t[1] for t in ticks], tickangle=-40)
-    fig.update_yaxes(tickmode="array", tickvals=[t[0] for t in ticks],
-                     ticktext=[t[1] for t in ticks])
+        z=M, x=groups, y=groups, colorscale="Viridis", zmin=0, zmax=1,
+        text=[[f"{M[i, j]:.2f}" for j in range(G)] for i in range(G)],
+        texttemplate="%{text}", textfont={"size": 12},
+        hovertemplate="%{y} ↔ %{x}: %{z:.2f}<extra></extra>"))
+    fig.update_layout(title="Average similarity between groups — bright diagonal = self-similar",
+                      height=460, yaxis=dict(autorange="reversed"))
     return fig
 
 def plotly_value_distributions(X, labels):
@@ -318,6 +319,42 @@ if "ask_counter" not in st.session_state:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
+    n_collected = len(st.session_state["collection"])
+    st.metric("Queries collected", n_collected)
+    if n_collected and st.button("🗑 Clear collection", use_container_width=True):
+        st.session_state["collection"] = []
+        st.rerun()
+
+    st.divider()
+    st.header("Demo data")
+    st.caption("Load example sentences to see the plots — no API key needed.")
+    if st.button("📥 Load synthetic dataset", use_container_width=True):
+        if not os.path.exists(SYNTHETIC_CSV):
+            st.error("synthetic_sentences.csv not found — run make_synthetic_dataset.py first.")
+        else:
+            sdf = pd.read_csv(SYNTHETIC_CSV)
+            model = load_sbert()          # cached; SBERT-only load for the demo
+            new_collection, done, total = [], 0, len(sdf)
+            prog = st.progress(0.0, text="Embedding synthetic sentences…")
+            for gname, gdf in sdf.groupby("group"):
+                records = []
+                for _, r in gdf.iterrows():
+                    text = str(r["response"])
+                    records.append({
+                        "model":    str(r.get("model", "syn")),
+                        "question": str(gname),
+                        "response": text,
+                        "sbert":    embed_sbert(text, model),
+                        "splade":   np.array([]),
+                    })
+                    done += 1
+                    prog.progress(done / total)
+                new_collection.append({"question": str(gname), "records": records})
+            st.session_state["collection"] = new_collection
+            st.success(f"Loaded {total} sentences in {len(new_collection)} groups — see tab 2.")
+            st.rerun()
+
+    st.divider()
     st.header("API Keys")
     openai_key = st.text_input("OpenAI", type="password", placeholder="sk-…")
     gemini_key = st.text_input("Gemini", type="password", placeholder="AIza…")
@@ -343,41 +380,6 @@ with st.sidebar:
         with st.spinner("Loading SPLADE…"):
             splade_tok, splade_model = load_splade()
         st.success("SPLADE ready")
-
-    st.divider()
-    st.header("Demo data")
-    if st.button("📥 Load synthetic dataset", use_container_width=True,
-                 help="Embeds synthetic_sentences.csv so the plots render without any API key"):
-        if not os.path.exists(SYNTHETIC_CSV):
-            st.error("synthetic_sentences.csv not found — run make_synthetic_dataset.py first.")
-        else:
-            sdf = pd.read_csv(SYNTHETIC_CSV)
-            new_collection, done, total = [], 0, len(sdf)
-            prog = st.progress(0.0, text="Embedding synthetic sentences…")
-            for gname, gdf in sdf.groupby("group"):
-                records = []
-                for _, r in gdf.iterrows():
-                    text = str(r["response"])
-                    records.append({
-                        "model":    str(r.get("model", "syn")),
-                        "question": str(gname),
-                        "response": text,
-                        "sbert":    embed_sbert(text, sbert_model),
-                        "splade":   embed_splade(text, splade_tok, splade_model) if compute_splade else np.array([]),
-                    })
-                    done += 1
-                    prog.progress(done / total)
-                new_collection.append({"question": str(gname), "records": records})
-            st.session_state["collection"] = new_collection
-            st.success(f"Loaded {total} sentences in {len(new_collection)} groups — see tab 2.")
-            st.rerun()
-
-    st.divider()
-    n_collected = len(st.session_state["collection"])
-    st.metric("Queries collected", n_collected)
-    if n_collected and st.button("🗑 Clear collection", use_container_width=True):
-        st.session_state["collection"] = []
-        st.rerun()
 
 # ── App title ─────────────────────────────────────────────────────────────────
 st.title("🔬 LLM Certainty Lab")
@@ -483,127 +485,44 @@ with tab_embed:
     collection = st.session_state["collection"]
 
     if not collection:
-        st.info('Ask a question in **1 · Ask Models**, then click "Embed & add to collection".')
+        st.info("Load the **synthetic dataset** from the sidebar, or ask a question in "
+                "**1 · Ask Models**, to see the data and the semantic map here.")
     else:
-        # Let the user pick which query to inspect
-        questions = [f"Q{i+1}: {e['question'][:80]}" for i, e in enumerate(collection)]
-        selected_q = st.selectbox("Inspect query", options=questions)
-        qi = questions.index(selected_q)
-        records = collection[qi]["records"]
-
-        col_remove, _ = st.columns([1, 4])
-        with col_remove:
-            if st.button("Remove this query from collection", key="remove_q"):
-                st.session_state["collection"].pop(qi)
-                st.rerun()
-
-        st.divider()
-
-        # ── SBERT ─────────────────────────────────────────────────────────────
-        st.subheader("SBERT — Distribution Curves (768 dims)")
-        st.caption(
-            "Overlapping curves → models agree on this question. "
-            "Spread apart → models disagree."
-        )
-        st.plotly_chart(
-            dist_plot({r["model"]: r["sbert"] for r in records},
-                      f"SBERT · {collection[qi]['question'][:60]}"),
-            use_container_width=True,
-        )
-
-        model_names = [r["model"] for r in records]
-        has_splade = any(getattr(r["splade"], "size", 0) for r in records)
-
-        # ── SPLADE (only when computed) ───────────────────────────────────────
-        if has_splade:
-            st.subheader("SPLADE — Distribution Curves (active dims)")
-            st.plotly_chart(
-                dist_plot({r["model"]: r["splade"][r["splade"] > 0] for r in records},
-                          f"SPLADE · {collection[qi]['question'][:60]}"),
-                use_container_width=True,
-            )
-
-            st.subheader("SPLADE — Top Activated Tokens")
-            sel_model = st.selectbox("Pick a model", options=model_names, key="tok_model")
-            rec = next(r for r in records if r["model"] == sel_model)
-            st.plotly_chart(token_bar(rec["splade"], splade_tok, sel_model),
-                            use_container_width=True)
-
-        # ── Summary table ─────────────────────────────────────────────────────
-        st.subheader("Numeric Summary")
-        summary_rows = []
-        for r in records:
-            row = {
-                "Model": r["model"],
-                "SBERT mean": round(float(np.mean(r["sbert"])), 5),
-                "SBERT std":  round(float(np.std(r["sbert"])),  5),
-            }
-            if has_splade:
-                row["SPLADE non-zero"] = int(np.count_nonzero(r["splade"]))
-                row["SPLADE max"]      = round(float(np.max(r["splade"])), 4)
-            summary_rows.append(row)
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
-
-        # ── Raw vector preview ────────────────────────────────────────────────
-        st.divider()
-        st.subheader("Raw Embedding Vectors")
-
-        prev_model = st.selectbox("Pick a model to inspect", options=model_names, key="vec_model")
-        prev_rec = next(r for r in records if r["model"] == prev_model)
-
-        st.markdown(f"**SBERT — {prev_model}** (768 values)")
-        sbert_vec = prev_rec["sbert"]
-        sbert_df = pd.DataFrame(
-            [sbert_vec.astype(float)],
-            columns=[str(i) for i in range(len(sbert_vec))],
-        )
-        st.dataframe(sbert_df, use_container_width=True)
-
-        if has_splade:
-            st.markdown(f"**SPLADE — {prev_model}** (active tokens only, sorted by value)")
-            splade_vec = prev_rec["splade"]
-            nz_idx = np.nonzero(splade_vec)[0]
-            nz_tokens = [splade_tok.convert_ids_to_tokens([int(i)])[0] for i in nz_idx]
-            nz_values = splade_vec[nz_idx].astype(float)
-            order = np.argsort(nz_values)[::-1]
-            splade_df = pd.DataFrame(
-                [nz_values[order]],
-                columns=[nz_tokens[i] for i in order],
-            )
-            st.dataframe(splade_df, use_container_width=True)
-
-        # ── Collection overview ───────────────────────────────────────────────
-        if len(collection) > 1:
-            st.divider()
-            st.subheader(f"Collection overview ({len(collection)} queries)")
-            overview = []
-            for i, entry in enumerate(collection):
-                for r in entry["records"]:
-                    overview.append({
-                        "Q#": i + 1,
-                        "Question": entry["question"][:70],
-                        "Model": r["model"],
-                        "SBERT std": round(float(np.std(r["sbert"])), 5),
-                        "SPLADE non-zero": int(np.count_nonzero(r["splade"])),
-                    })
-            st.dataframe(pd.DataFrame(overview), use_container_width=True)
-
-        # ── Collection-wide interactive plots (Plotly — zoom/pan/hover) ───────
         all_records = [(e["question"], r) for e in collection for r in e["records"]]
+
+        # ── The loaded data — one tab per group, side by side ─────────────────
+        st.subheader(f"Loaded data — {len(collection)} groups · {len(all_records)} responses")
+        groups = list(dict.fromkeys(q for q, _ in all_records))
+        for tab, g in zip(st.tabs([g[:28] for g in groups]), groups):
+            with tab:
+                st.dataframe(
+                    pd.DataFrame([{"model": r["model"], "response": r["response"]}
+                                 for q, r in all_records if q == g]),
+                    use_container_width=True, hide_index=True,
+                )
+        if st.button("🗑 Clear all", key="clear_embed"):
+            st.session_state["collection"] = []
+            st.rerun()
+
         if len(all_records) >= 2:
-            st.divider()
-            st.subheader("Collection-wide analysis")
             X = np.array([r["sbert"] for _, r in all_records], dtype=float)
-            labels = [q[:24] for q, _ in all_records]     # each question/group is a cluster
+            labels = [q[:24] for q, _ in all_records]     # each group/question is a cluster
             mdls   = [r["model"] for _, r in all_records]
             texts  = [r["response"] for _, r in all_records]
 
-            st.markdown("**Semantic map** — drag to zoom, hover to read the response")
+            # ── Value distribution (shown first) ──────────────────────────────
+            st.divider()
+            st.subheader("Value distribution")
+            st.caption("Each response's embedding values as a curve — raw vs L2-normalized.")
+            st.plotly_chart(plotly_value_distributions(X, labels), use_container_width=True)
+
+            # ── Semantic map ──────────────────────────────────────────────────
+            st.divider()
+            st.subheader("Semantic map")
+            st.caption("Same meaning clusters together, different meaning lands apart. "
+                       "Drag to zoom, hover to read a response.")
             st.plotly_chart(plotly_pca_scatter(X, labels, mdls, texts), use_container_width=True)
             st.plotly_chart(plotly_cosine_heatmap(X, labels, texts), use_container_width=True)
-
-            st.markdown("**Value distribution** — raw vs L2-normalized (why the OpenAI vectors collapsed)")
-            st.plotly_chart(plotly_value_distributions(X, labels), use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 3 — Export

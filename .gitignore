@@ -1,2 +1,4 @@
 *.csv
 *.md
+# but the demo dataset must ship so the "Load synthetic dataset" button works on Streamlit Cloud
+!synthetic_sentences.csv
