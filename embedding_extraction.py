@@ -10,13 +10,23 @@ import json
 import time
 import concurrent.futures
 import streamlit as st
+import os
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
 import requests
-from sentence_transformers import SentenceTransformer
+from scipy.stats import gaussian_kde
+from sentence_transformers import SentenceTransformer, models
 import torch
 from transformers import AutoTokenizer, AutoModelForMaskedLM
+
+# 2-D PCA helper shared with the standalone plot_distributions.py CLI.
+from plot_distributions import _pca2
+# Word-level context-awareness study, reused live in the app.
+from context_awareness import WORDS as CTX_WORDS, analyze as ctx_analyze
+
+SYNTHETIC_CSV = os.path.join(os.path.dirname(__file__), "synthetic_sentences.csv")
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="LLM Certainty Lab", page_icon="🔬", layout="wide")
@@ -31,7 +41,12 @@ COLORS = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2",
 # ── Embedding models (cached) ─────────────────────────────────────────────────
 @st.cache_resource
 def load_sbert():
-    return SentenceTransformer("all-mpnet-base-v2")
+    # Built WITHOUT the Normalize layer: stock all-mpnet-base-v2 ends in a Normalize module
+    # that forces every vector to unit length (same problem as OpenAI), collapsing the value
+    # distributions. Transformer + mean Pooling only keeps the true, varying magnitude.
+    word = models.Transformer("sentence-transformers/all-mpnet-base-v2")
+    pool = models.Pooling(word.get_word_embedding_dimension(), pooling_mode="mean")
+    return SentenceTransformer(modules=[word, pool])
 
 @st.cache_resource
 def load_splade():
@@ -98,7 +113,9 @@ def run_all_models(prompt, openai_key, gemini_key, gemini_model_id, selected_oll
 
 # ── Embedding functions ───────────────────────────────────────────────────────
 def embed_sbert(text, model):
-    return model.encode(text, normalize_embeddings=True)
+    # Raw, un-normalized on purpose: L2-normalizing forces every vector to length 1, which
+    # collapses each response's value distribution to the same bell curve (why OpenAI failed).
+    return model.encode(text, normalize_embeddings=False)
 
 def embed_splade(text, tokenizer, model):
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
@@ -131,6 +148,111 @@ def token_bar(vec, tokenizer, label):
     fig.update_layout(title=f"Top SPLADE tokens — {label[:50]}",
                       xaxis_title="Token", yaxis_title="Activation", height=380)
     return fig
+
+# ── Interactive collection-wide plots (Plotly — zoom/pan/hover) ───────────────
+def _group_colors(labels):
+    uniq = list(dict.fromkeys(labels))
+    return uniq, {g: COLORS[i % len(COLORS)] for i, g in enumerate(uniq)}
+
+def plotly_pca_scatter(X, labels, models, texts):
+    Xn = X / np.clip(np.linalg.norm(X, axis=1, keepdims=True), 1e-12, None)
+    coords = _pca2(Xn)
+    uniq, color = _group_colors(labels)
+    fig = go.Figure()
+    for g in uniq:
+        idx = [i for i, l in enumerate(labels) if l == g]
+        fig.add_trace(go.Scatter(
+            x=coords[idx, 0], y=coords[idx, 1], mode="markers", name=g,
+            marker=dict(size=11, color=color[g], line=dict(width=1, color="white")),
+            text=[f"{models[i]}<br>{texts[i][:90]}" for i in idx],
+            hovertemplate="%{text}<extra>" + g + "</extra>",
+        ))
+    fig.update_layout(title="PCA (2-D) — clusters are topics (drag to zoom)",
+                      xaxis_title="PC1", yaxis_title="PC2", height=560,
+                      legend=dict(orientation="h", y=-0.2))
+    return fig
+
+def plotly_cosine_heatmap(X, labels, texts):
+    Xn = X / np.clip(np.linalg.norm(X, axis=1, keepdims=True), 1e-12, None)
+    uniq, _ = _group_colors(labels)
+    order = np.argsort([uniq.index(l) for l in labels])
+    lo = [labels[i] for i in order]
+    to = [texts[i][:60] for i in order]
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):  # spurious BLAS FP flags
+        sim = Xn[order] @ Xn[order].T
+    fig = go.Figure(go.Heatmap(
+        z=sim, colorscale="Viridis", zmin=0, zmax=1,
+        hovertext=[[f"{lo[i]} ↔ {lo[j]}<br>{to[i]}<br>{to[j]}<br>cos={sim[i, j]:.2f}"
+                    for j in range(len(order))] for i in range(len(order))],
+        hoverinfo="text",
+    ))
+    ticks, pos = [], 0
+    for g in uniq:
+        c = lo.count(g); ticks.append((pos + c / 2 - 0.5, g)); pos += c
+    fig.update_layout(title="Cosine similarity (grouped) — bright blocks = same meaning",
+                      height=560, yaxis=dict(autorange="reversed"))
+    fig.update_xaxes(tickmode="array", tickvals=[t[0] for t in ticks],
+                     ticktext=[t[1] for t in ticks], tickangle=-40)
+    fig.update_yaxes(tickmode="array", tickvals=[t[0] for t in ticks],
+                     ticktext=[t[1] for t in ticks])
+    return fig
+
+def plotly_value_distributions(X, labels):
+    norms = np.linalg.norm(X, axis=1)
+    Xn = X / np.clip(norms, 1e-12, None)[:, None]
+    uniq, color = _group_colors(labels)
+    fig = make_subplots(rows=1, cols=2, subplot_titles=(
+        "RAW SBERT (curves separate)", "L2-NORMALIZED (collapse — the OpenAI case)"))
+    for col, data in ((1, X), (2, Xn)):
+        grid = np.linspace(data.min(), data.max(), 300)
+        seen = set()
+        for row, lab in zip(data, labels):
+            show = lab not in seen; seen.add(lab)
+            fig.add_trace(go.Scatter(
+                x=grid, y=gaussian_kde(row)(grid), mode="lines",
+                line=dict(color=color[lab], width=1.5), opacity=0.7,
+                name=lab, legendgroup=lab, showlegend=(show and col == 1)),
+                row=1, col=col)
+    fig.update_layout(title="Per-response value distribution — raw vs normalized",
+                      height=480, legend=dict(orientation="h", y=-0.25))
+    return fig
+
+# ── Context-awareness plots (word-level, Plotly) ──────────────────────────────
+def ctx_summary_fig(results):
+    words = sorted(results, key=lambda w: results[w]["gap"], reverse=True)
+    fig = go.Figure()
+    fig.add_bar(x=words, y=[results[w]["within"] for w in words], name="same sense", marker_color="#2ca02c")
+    fig.add_bar(x=words, y=[results[w]["cross"] for w in words], name="different sense", marker_color="#d62728")
+    fig.update_layout(barmode="group", yaxis_title="cosine similarity", yaxis_range=[0, 1],
+                      title="Context-awareness per word — same-sense high, different-sense low",
+                      height=460, legend=dict(orientation="h", y=-0.2))
+    return fig
+
+def ctx_heatmap_fig(word, r):
+    V = r["vecs"]
+    Vn = V / np.clip(np.linalg.norm(V, axis=1, keepdims=True), 1e-12, None)
+    order = np.argsort([r["senses"].index(l) for l in r["labels"]])
+    lab = [r["labels"][i] for i in order]
+    sent = [r["sentences"][i] for i in order]
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        sim = Vn[order] @ Vn[order].T
+    fig = go.Figure(go.Heatmap(
+        z=sim, zmin=0, zmax=1, colorscale="Viridis",
+        hovertext=[[f"{lab[i]} / {lab[j]}<br>{sent[i][:55]}<br>{sent[j][:55]}<br>cos={sim[i, j]:.2f}"
+                    for j in range(len(order))] for i in range(len(order))],
+        hoverinfo="text"))
+    fig.update_layout(title=f"'{word}' — bright = same sense, dark = different  (gap {r['gap']:+.2f})",
+                      height=480, yaxis=dict(autorange="reversed"))
+    return fig
+
+def ctx_csv(results):
+    import io, csv as _csv
+    buf = io.StringIO(); w = _csv.writer(buf)
+    w.writerow(["word", "sense", "sentence"] + [f"dim_{i}" for i in range(768)])
+    for word, r in results.items():
+        for v, sense, s in zip(r["vecs"], r["labels"], r["sentences"]):
+            w.writerow([word, sense, s] + [round(float(x), 6) for x in v])
+    return buf.getvalue()
 
 # ── Export helpers (operate on the full collection) ───────────────────────────
 def collection_to_full_csv(collection):
@@ -184,7 +306,7 @@ def collection_to_summary_csv(collection):
                 "sbert_mean": round(float(np.mean(r["sbert"])), 6),
                 "sbert_std":  round(float(np.std(r["sbert"])),  6),
                 "splade_nonzero": int(np.count_nonzero(r["splade"])),
-                "splade_max":     round(float(np.max(r["splade"])), 4),
+                "splade_max":     round(float(np.max(r["splade"])), 4) if getattr(r["splade"], "size", 0) else 0.0,
             })
     return pd.DataFrame(rows).to_csv(index=False)
 
@@ -213,9 +335,42 @@ with st.sidebar:
     with st.spinner("Loading SBERT…"):
         sbert_model = load_sbert()
     st.success("SBERT ready")
-    with st.spinner("Loading SPLADE…"):
-        splade_tok, splade_model = load_splade()
-    st.success("SPLADE ready")
+    compute_splade = st.checkbox(
+        "Also compute SPLADE (interpretable, slower)", value=False,
+        help="Sparse lexical embedding — off by default; SBERT is the focus of the analysis.")
+    splade_tok = splade_model = None
+    if compute_splade:
+        with st.spinner("Loading SPLADE…"):
+            splade_tok, splade_model = load_splade()
+        st.success("SPLADE ready")
+
+    st.divider()
+    st.header("Demo data")
+    if st.button("📥 Load synthetic dataset", use_container_width=True,
+                 help="Embeds synthetic_sentences.csv so the plots render without any API key"):
+        if not os.path.exists(SYNTHETIC_CSV):
+            st.error("synthetic_sentences.csv not found — run make_synthetic_dataset.py first.")
+        else:
+            sdf = pd.read_csv(SYNTHETIC_CSV)
+            new_collection, done, total = [], 0, len(sdf)
+            prog = st.progress(0.0, text="Embedding synthetic sentences…")
+            for gname, gdf in sdf.groupby("group"):
+                records = []
+                for _, r in gdf.iterrows():
+                    text = str(r["response"])
+                    records.append({
+                        "model":    str(r.get("model", "syn")),
+                        "question": str(gname),
+                        "response": text,
+                        "sbert":    embed_sbert(text, sbert_model),
+                        "splade":   embed_splade(text, splade_tok, splade_model) if compute_splade else np.array([]),
+                    })
+                    done += 1
+                    prog.progress(done / total)
+                new_collection.append({"question": str(gname), "records": records})
+            st.session_state["collection"] = new_collection
+            st.success(f"Loaded {total} sentences in {len(new_collection)} groups — see tab 2.")
+            st.rerun()
 
     st.divider()
     n_collected = len(st.session_state["collection"])
@@ -227,10 +382,11 @@ with st.sidebar:
 # ── App title ─────────────────────────────────────────────────────────────────
 st.title("🔬 LLM Certainty Lab")
 
-tab_ask, tab_embed, tab_export = st.tabs([
+tab_ask, tab_embed, tab_export, tab_context = st.tabs([
     "1 · Ask Models",
     "2 · Embeddings & Plots",
     "3 · Export",
+    "4 · Context-Awareness",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -302,7 +458,7 @@ with tab_ask:
                     "question": data["question"],
                     "response": text,
                     "sbert":    embed_sbert(text, sbert_model),
-                    "splade":   embed_splade(text, splade_tok, splade_model),
+                    "splade":   embed_splade(text, splade_tok, splade_model) if compute_splade else np.array([]),
                 })
                 prog.progress((idx + 1) / len(good))
 
@@ -355,31 +511,38 @@ with tab_embed:
             use_container_width=True,
         )
 
-        # ── SPLADE ────────────────────────────────────────────────────────────
-        st.subheader("SPLADE — Distribution Curves (active dims)")
-        st.plotly_chart(
-            dist_plot({r["model"]: r["splade"][r["splade"] > 0] for r in records},
-                      f"SPLADE · {collection[qi]['question'][:60]}"),
-            use_container_width=True,
-        )
-
-        # ── SPLADE top tokens ─────────────────────────────────────────────────
-        st.subheader("SPLADE — Top Activated Tokens")
         model_names = [r["model"] for r in records]
-        sel_model = st.selectbox("Pick a model", options=model_names, key="tok_model")
-        rec = next(r for r in records if r["model"] == sel_model)
-        st.plotly_chart(token_bar(rec["splade"], splade_tok, sel_model),
-                        use_container_width=True)
+        has_splade = any(getattr(r["splade"], "size", 0) for r in records)
+
+        # ── SPLADE (only when computed) ───────────────────────────────────────
+        if has_splade:
+            st.subheader("SPLADE — Distribution Curves (active dims)")
+            st.plotly_chart(
+                dist_plot({r["model"]: r["splade"][r["splade"] > 0] for r in records},
+                          f"SPLADE · {collection[qi]['question'][:60]}"),
+                use_container_width=True,
+            )
+
+            st.subheader("SPLADE — Top Activated Tokens")
+            sel_model = st.selectbox("Pick a model", options=model_names, key="tok_model")
+            rec = next(r for r in records if r["model"] == sel_model)
+            st.plotly_chart(token_bar(rec["splade"], splade_tok, sel_model),
+                            use_container_width=True)
 
         # ── Summary table ─────────────────────────────────────────────────────
         st.subheader("Numeric Summary")
-        st.dataframe(pd.DataFrame([{
-            "Model": r["model"],
-            "SBERT mean": round(float(np.mean(r["sbert"])), 5),
-            "SBERT std":  round(float(np.std(r["sbert"])),  5),
-            "SPLADE non-zero": int(np.count_nonzero(r["splade"])),
-            "SPLADE max":      round(float(np.max(r["splade"])), 4),
-        } for r in records]), use_container_width=True)
+        summary_rows = []
+        for r in records:
+            row = {
+                "Model": r["model"],
+                "SBERT mean": round(float(np.mean(r["sbert"])), 5),
+                "SBERT std":  round(float(np.std(r["sbert"])),  5),
+            }
+            if has_splade:
+                row["SPLADE non-zero"] = int(np.count_nonzero(r["splade"]))
+                row["SPLADE max"]      = round(float(np.max(r["splade"])), 4)
+            summary_rows.append(row)
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
         # ── Raw vector preview ────────────────────────────────────────────────
         st.divider()
@@ -396,17 +559,18 @@ with tab_embed:
         )
         st.dataframe(sbert_df, use_container_width=True)
 
-        st.markdown(f"**SPLADE — {prev_model}** (active tokens only, sorted by value)")
-        splade_vec = prev_rec["splade"]
-        nz_idx = np.nonzero(splade_vec)[0]
-        nz_tokens = [splade_tok.convert_ids_to_tokens([int(i)])[0] for i in nz_idx]
-        nz_values = splade_vec[nz_idx].astype(float)
-        order = np.argsort(nz_values)[::-1]
-        splade_df = pd.DataFrame(
-            [nz_values[order]],
-            columns=[nz_tokens[i] for i in order],
-        )
-        st.dataframe(splade_df, use_container_width=True)
+        if has_splade:
+            st.markdown(f"**SPLADE — {prev_model}** (active tokens only, sorted by value)")
+            splade_vec = prev_rec["splade"]
+            nz_idx = np.nonzero(splade_vec)[0]
+            nz_tokens = [splade_tok.convert_ids_to_tokens([int(i)])[0] for i in nz_idx]
+            nz_values = splade_vec[nz_idx].astype(float)
+            order = np.argsort(nz_values)[::-1]
+            splade_df = pd.DataFrame(
+                [nz_values[order]],
+                columns=[nz_tokens[i] for i in order],
+            )
+            st.dataframe(splade_df, use_container_width=True)
 
         # ── Collection overview ───────────────────────────────────────────────
         if len(collection) > 1:
@@ -424,6 +588,23 @@ with tab_embed:
                     })
             st.dataframe(pd.DataFrame(overview), use_container_width=True)
 
+        # ── Collection-wide interactive plots (Plotly — zoom/pan/hover) ───────
+        all_records = [(e["question"], r) for e in collection for r in e["records"]]
+        if len(all_records) >= 2:
+            st.divider()
+            st.subheader("Collection-wide analysis")
+            X = np.array([r["sbert"] for _, r in all_records], dtype=float)
+            labels = [q[:24] for q, _ in all_records]     # each question/group is a cluster
+            mdls   = [r["model"] for _, r in all_records]
+            texts  = [r["response"] for _, r in all_records]
+
+            st.markdown("**Semantic map** — drag to zoom, hover to read the response")
+            st.plotly_chart(plotly_pca_scatter(X, labels, mdls, texts), use_container_width=True)
+            st.plotly_chart(plotly_cosine_heatmap(X, labels, texts), use_container_width=True)
+
+            st.markdown("**Value distribution** — raw vs L2-normalized (why the OpenAI vectors collapsed)")
+            st.plotly_chart(plotly_value_distributions(X, labels), use_container_width=True)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 3 — Export
 # ══════════════════════════════════════════════════════════════════════════════
@@ -435,6 +616,19 @@ with tab_export:
     else:
         total_records = sum(len(e["records"]) for e in collection)
         st.subheader(f"Download — {len(collection)} queries · {total_records} embeddings")
+
+        # ── Save raw vectors to a file on disk ────────────────────────────────
+        st.markdown("#### Save raw vectors to disk")
+        default_path = os.path.join(os.path.dirname(__file__), "raw_vectors.csv")
+        save_path = st.text_input("File path", value=default_path, key="save_path")
+        if st.button("💾 Save full CSV (raw SBERT + sparse SPLADE)"):
+            try:
+                with open(save_path, "w") as fh:
+                    fh.write(collection_to_full_csv(collection))
+                st.success(f"Saved {total_records} rows → {save_path}")
+            except Exception as exc:
+                st.error(f"Could not save: {exc}")
+        st.divider()
 
         # ── Per-query download ────────────────────────────────────────────────
         st.markdown("#### Per-query downloads")
@@ -491,3 +685,44 @@ with tab_export:
         st.divider()
         st.subheader("JSON Preview (first query)")
         st.json(json.loads(collection_to_json(collection[:1])))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 4 — Context-Awareness (word-level, pre-normalization vectors)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_context:
+    st.caption(
+        "The raw (pre-normalization) contextual vector of an ambiguous word is **close within a "
+        "sense** and **far across senses**. This is context-awareness — shown with cosine, no PCA. "
+        "Uses the transformer's token vectors before pooling/normalization."
+    )
+    chosen = st.multiselect(
+        "Ambiguous words", options=list(CTX_WORDS), default=list(CTX_WORDS)[:8],
+        help="Each word has two senses × sample sentences (defined in context_awareness.py).")
+
+    if st.button("▶ Run context-awareness analysis", type="primary", disabled=not chosen):
+        with st.spinner(f"Embedding {len(chosen)} words…"):
+            # reuse the already-loaded SBERT transformer (no second model download)
+            hf_model = sbert_model[0].auto_model
+            hf_tok = sbert_model[0].tokenizer
+            st.session_state["ctx_results"] = ctx_analyze(
+                hf_model, hf_tok, {w: CTX_WORDS[w] for w in chosen})
+
+    results = st.session_state.get("ctx_results")
+    if results:
+        gaps = [results[w]["gap"] for w in results]
+        st.metric("Mean gap (same − different)", f"{np.mean(gaps):+.3f}",
+                  help="Positive for every word means each word moves with its context.")
+        st.plotly_chart(ctx_summary_fig(results), use_container_width=True)
+
+        word = st.selectbox("Inspect a word's cosine heatmap", options=list(results))
+        st.plotly_chart(ctx_heatmap_fig(word, results[word]), use_container_width=True)
+
+        st.dataframe(pd.DataFrame(
+            [(w, round(results[w]["within"], 3), round(results[w]["cross"], 3), round(results[w]["gap"], 3))
+             for w in sorted(results, key=lambda w: results[w]["gap"], reverse=True)],
+            columns=["word", "same-sense", "different-sense", "gap"]), use_container_width=True)
+
+        st.download_button("⬇ Download raw word vectors (CSV, pre-normalization)",
+                           ctx_csv(results).encode(), "word_context_vectors.csv", "text/csv")
+    else:
+        st.info("Pick some words and click **Run** to compute the vectors and plots.")
